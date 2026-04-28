@@ -1,0 +1,12 @@
+# E2E 测试生成的文件
+e2e_session.json
+e2e_report.json
+e2e_test_files/*.bin
+e2e_test_files/*.mp4
+e2e_test_files/att_*
+e2e_test_files/attachments/
+
+# 保留测试文件的 README
+!e2e_test_files/README.md
+!e2e_test_files/test.txt
+!e2e_test_files/test.png
