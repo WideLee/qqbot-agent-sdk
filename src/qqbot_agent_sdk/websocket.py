@@ -245,16 +245,33 @@ class QQWebSocket:
         """Open a WebSocket connection (runs in the *current* loop).
 
         Used internally during reconnect and by tests.
+        
+        Honors proxy environment variables for WebSocket connections
+        (fix 044348411 — critical for WSL/proxy environments).
         """
+        import os
+        
         if self._ws and not self._ws.closed:
             await self._ws.close()
 
         # Store session first so it's available for reconnect even if ws_connect fails
         self._session = aio_session
+        
+        # Honor WSL proxy env for QQ WebSocket (fix 044348411)
+        ws_proxy = (
+            os.getenv("WSS_PROXY")
+            or os.getenv("wss_proxy")
+            or os.getenv("HTTPS_PROXY")
+            or os.getenv("https_proxy")
+            or os.getenv("ALL_PROXY")
+            or os.getenv("all_proxy")
+        )
+        
         self._ws = await aio_session.ws_connect(
             gateway_url,
             headers={"User-Agent": build_user_agent()},
             timeout=CONNECT_TIMEOUT_SECONDS,
+            proxy=ws_proxy,
         )
         logger.info("[%s] WebSocket connected to %s", self._log_tag, gateway_url)
 
@@ -304,10 +321,14 @@ class QQWebSocket:
         Creates its own aiohttp.ClientSession so nothing from the main loop
         bleeds into the WS thread loop.  Token refresh uses the synchronous
         ``get_token`` callback (httpx.Client), which is safe from any thread.
+        
+        Honors proxy environment variables (WSS_PROXY, HTTPS_PROXY, ALL_PROXY) for
+        WebSocket connections behind corporate proxies / WSL environments.
         """
         import aiohttp as _aiohttp
 
-        async with _aiohttp.ClientSession() as aio_session:
+        # Honor proxy env vars (fix 044348411)
+        async with _aiohttp.ClientSession(trust_env=True) as aio_session:
             await self.open(gateway_url, aio_session)
             self.start_listeners()
             tasks = [t for t in (self._listen_task, self._heartbeat_task) if t]
