@@ -104,7 +104,7 @@ class SDKConfig:
         User-Agent header inside the parentheses, separated by semicolons.
         Example: ``["MyApp/1.0.0", "Production"]`` produces::
 
-            QQBotAdapter/1.2.1 (Python/3.11; darwin; MyApp/1.0.0; Production)
+            QQBotAdapter/<sdk_version> (Python/3.11; darwin; MyApp/1.0.0; Production)
     """
 
     source: str = ""
@@ -147,7 +147,7 @@ def configure(
         host framework and environment in server logs.  Example::
 
             configure(extra_ua_items=["MyApp/1.0.0", "Production"])
-            # → QQBotAdapter/1.2.1 (Python/3.11; darwin; MyApp/1.0.0; Production)
+            # → QQBotAdapter/<sdk_version> (Python/3.11; darwin; MyApp/1.0.0; Production)
 
     Example::
 

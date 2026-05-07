@@ -34,7 +34,7 @@ def build_user_agent() -> str:
 
     Example::
 
-        QQBotAdapter/1.2.1 (Python/3.11.9; darwin; MyApp/1.0.0)
+        QQBotAdapter/<sdk_version> (Python/3.11.9; darwin; MyApp/1.0.0)
     """
     from .constants import sdk_config  # local import to avoid circular dep
 
