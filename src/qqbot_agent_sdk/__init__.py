@@ -91,7 +91,12 @@ from .dto import (  # noqa: F401
 )
 
 # ── Audio utilities ───────────────────────────────────────────────────
-from .audio import is_voice_content_type, resolve_stt_config  # noqa: F401
+from .audio import (  # noqa: F401
+    STTConfig,
+    STTPipeline,
+    is_voice_content_type,
+    resolve_stt_config,
+)
 
 # ── Session persistence ───────────────────────────────────────────────
 from .session_store import WSSessionStore  # noqa: F401

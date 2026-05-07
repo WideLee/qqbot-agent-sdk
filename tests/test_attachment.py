@@ -18,6 +18,7 @@ from qqbot_agent_sdk.attachment import (
     AttachmentProcessor,
     _safe_url_for_log,
     _ssrf_redirect_guard,
+    describe_attachment,
 )
 from qqbot_agent_sdk.dto import MessageAttachment
 
@@ -351,17 +352,166 @@ async def test_processor_handles_document(processor, mock_http_client):
 
 
 @pytest.mark.asyncio
-async def test_processor_skips_voice_without_stt(processor):
-    """Test processor skips voice attachments when STT is None."""
+async def test_processor_voice_without_stt_uses_asr_refer_text(processor, mock_http_client):
+    """Without STT, asr_refer_text (if present) drives the description.
+
+    The processor still attempts to download the WAV so ``local_path`` is
+    populated for downstream consumers.
+    """
+    attachment = MessageAttachment(
+        url="https://cdn.qq.com/voice.silk",
+        content_type="audio/silk",
+        filename="voice.silk",
+        asr_refer_text="一二三四五六",
+    )
+
+    # Mock a successful audio download.
+    mock_response = Mock()
+    mock_response.content = b"fake_audio"
+    mock_response.raise_for_status = Mock()
+    mock_http_client.get = AsyncMock(return_value=mock_response)
+
+    results = await processor.process([attachment])
+
+    assert len(results) == 1
+    r = results[0]
+    assert r.kind == "voice"
+    assert r.transcript == "一二三四五六"
+    # local_path is populated (cached audio file lives in temp_cache_dir).
+    assert r.local_path
+    assert Path(r.local_path).exists()
+    # description embeds both the transcript and the cache path.
+    assert r.description.startswith("[voice: 一二三四五六 (")
+    assert r.description.endswith(")]")
+
+
+@pytest.mark.asyncio
+async def test_processor_voice_without_stt_no_transcript(processor, mock_http_client):
+    """Without STT and without asr_refer_text → generic ``[voice message]`` marker."""
     attachment = MessageAttachment(
         url="https://cdn.qq.com/voice.silk",
         content_type="audio/silk",
         filename="voice.silk",
     )
 
+    # Audio download succeeds (so local_path is filled), but no transcript.
+    mock_response = Mock()
+    mock_response.content = b"fake_audio"
+    mock_response.raise_for_status = Mock()
+    mock_http_client.get = AsyncMock(return_value=mock_response)
+
     results = await processor.process([attachment])
 
-    assert len(results) == 0  # Voice skipped
+    assert len(results) == 1
+    r = results[0]
+    assert r.kind == "voice"
+    assert r.transcript == ""
+    assert r.local_path  # download succeeded
+    # No transcript → cached-only voice description.
+    assert r.description.startswith("[voice message (")
+    assert r.description.endswith(")]")
+
+
+@pytest.mark.asyncio
+async def test_processor_voice_without_stt_download_failure(processor, mock_http_client):
+    """Voice attachment without STT, with download failure → empty local_path."""
+    import httpx
+
+    attachment = MessageAttachment(
+        url="https://cdn.qq.com/voice.silk",
+        content_type="audio/silk",
+        filename="voice.silk",
+        asr_refer_text="hi",
+    )
+
+    # All download attempts (incl. retries) fail with non-retryable error.
+    mock_response_404 = Mock()
+    mock_response_404.status_code = 404
+    mock_http_client.get = AsyncMock(
+        side_effect=httpx.HTTPStatusError("404", request=Mock(), response=mock_response_404)
+    )
+
+    results = await processor.process([attachment])
+
+    assert len(results) == 1
+    r = results[0]
+    assert r.local_path == ""
+    assert r.transcript == "hi"
+    # No cache path in description when download failed.
+    assert r.description == "[voice: hi]"
+
+
+@pytest.mark.asyncio
+async def test_processor_voice_with_stt_embeds_transcript(downloader):
+    """STT-produced transcript and WAV path are surfaced together."""
+    mock_stt = Mock()
+    mock_stt.transcribe_with_path = AsyncMock(
+        return_value=("hello world", "/cache/v.wav"),
+    )
+
+    proc = AttachmentProcessor(downloader=downloader, stt_pipeline=mock_stt)
+    attachment = MessageAttachment(
+        url="https://cdn.qq.com/voice.silk",
+        content_type="audio/silk",
+        filename="voice.silk",
+    )
+
+    results = await proc.process([attachment])
+
+    assert len(results) == 1
+    r = results[0]
+    assert r.kind == "voice"
+    assert r.transcript == "hello world"
+    assert r.local_path == "/cache/v.wav"
+    # description carries both the transcript and the cache path.
+    assert r.description == "[voice: hello world (/cache/v.wav)]"
+
+
+@pytest.mark.asyncio
+async def test_processor_voice_with_stt_failure_falls_back_to_generic(downloader):
+    """STT yields no transcript and no cache path → generic ``[voice message]``."""
+    mock_stt = Mock()
+    mock_stt.transcribe_with_path = AsyncMock(return_value=(None, None))
+
+    proc = AttachmentProcessor(downloader=downloader, stt_pipeline=mock_stt)
+    attachment = MessageAttachment(
+        url="https://cdn.qq.com/voice.silk",
+        content_type="audio/silk",
+        filename="voice.silk",
+    )
+
+    results = await proc.process([attachment])
+
+    assert len(results) == 1
+    r = results[0]
+    assert r.transcript == ""
+    assert r.local_path == ""
+    assert r.description == "[voice message]"
+
+
+@pytest.mark.asyncio
+async def test_processor_voice_with_stt_partial_failure_keeps_wav(downloader):
+    """STT API failure but WAV download succeeded → ``local_path`` retained."""
+    mock_stt = Mock()
+    # Simulate: download/convert succeeded but STT call returned no text;
+    # asr_refer_text on the attachment provides the fallback transcript.
+    mock_stt.transcribe_with_path = AsyncMock(
+        return_value=("qq-asr", "/cache/v.wav"),
+    )
+
+    proc = AttachmentProcessor(downloader=downloader, stt_pipeline=mock_stt)
+    attachment = MessageAttachment(
+        url="https://cdn.qq.com/voice.silk",
+        content_type="audio/silk",
+        filename="voice.silk",
+        asr_refer_text="qq-asr",
+    )
+
+    results = await proc.process([attachment])
+    r = results[0]
+    assert r.transcript == "qq-asr"
+    assert r.local_path == "/cache/v.wav"
+    assert r.description == "[voice: qq-asr (/cache/v.wav)]"
 
 
 @pytest.mark.asyncio
@@ -442,3 +592,71 @@ async def test_full_pipeline_with_retry(temp_cache_dir):
     assert results[0].kind == "image"
     assert Path(results[0].local_path).read_bytes() == b"recovered_data"
     assert mock_http_client.get.call_count == 2  # Retry happened
+
+
+# ── describe_attachment Tests ─────────────────────────────────────────
+
+class TestDescribeAttachment:
+    """Unit tests for the unified description formatter."""
+
+    def test_image_with_filename_and_path(self):
+        assert describe_attachment(
+            "image/jpeg", "photo.jpg", "/tmp/photo.jpg",
+        ) == "[image: photo.jpg (/tmp/photo.jpg)]"
+
+    def test_image_with_filename_only(self):
+        assert describe_attachment("image/png", "a.png") == "[image: a.png]"
+
+    def test_image_no_filename(self):
+        assert describe_attachment("image/gif", "") == "[image]"
+
+    def test_voice_no_transcript_no_cache(self):
+        assert describe_attachment("audio/silk", "") == "[voice message]"
+
+    def test_voice_with_cache_only(self):
+        assert describe_attachment(
+            "audio/silk", "", "/tmp/a.wav",
+        ) == "[voice message (/tmp/a.wav)]"
+
+    def test_voice_with_transcript_only(self):
+        assert describe_attachment(
+            "voice", "", None, transcript="一二三四",
+        ) == "[voice: 一二三四]"
+
+    def test_voice_with_transcript_and_cache(self):
+        assert describe_attachment(
+            "audio/silk", "a.amr", "/tmp/a.wav", transcript="hello",
+        ) == "[voice: hello (/tmp/a.wav)]"
+
+    def test_voice_transcript_whitespace_is_stripped(self):
+        assert describe_attachment(
+            "audio/silk", "", None, transcript="  \n",
+        ) == "[voice message]"
+
+    def test_voice_ct_variants(self):
+        """All common voice content types should hit the voice branch."""
+        for ct in ("voice", "audio/amr", "audio/silk", "application/silk"):
+            result = describe_attachment(ct, "", None, transcript="x")
+            assert result == "[voice: x]", f"ct={ct!r} produced {result!r}"
+
+    def test_video_with_filename_and_path(self):
+        assert describe_attachment(
+            "video/mp4", "clip.mp4", "/tmp/c.mp4",
+        ) == "[video: clip.mp4 (/tmp/c.mp4)]"
+
+    def test_video_no_filename(self):
+        assert describe_attachment("video/mp4", "") == "[video]"
+
+    def test_generic_file_with_filename(self):
+        assert describe_attachment(
+            "application/pdf", "report.pdf",
+        ) == "[file: report.pdf]"
+
+    def test_generic_file_no_filename(self):
+        assert describe_attachment("application/octet-stream", "") == "[attachment]"
+
+    def test_transcript_ignored_for_non_voice(self):
+        """transcript parameter must not leak into non-voice descriptions."""
+        assert describe_attachment(
+            "image/jpeg", "x.jpg", transcript="bogus",
+        ) == "[image: x.jpg]"

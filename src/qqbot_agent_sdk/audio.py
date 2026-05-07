@@ -466,12 +466,20 @@ def _extract_stt_text(result: Dict[str, Any]) -> Optional[str]:
 class STTPipeline:
     """Voice-to-text transcription pipeline.
 
-    Encapsulates the four-step process:
+    Strategy (in priority order):
 
-    1. Use QQ's built-in ``asr_refer_text`` if available (free, no API call).
-    2. Resolve the download URL (prefer ``voice_wav_url`` — already WAV).
-    3. Download and convert audio to WAV.
-    4. Call the configured STT API.
+    1. If STT is configured, try the configured STT API first:
+       a. Resolve the download URL (prefer ``voice_wav_url`` — already WAV).
+       b. Download and convert audio to WAV.
+       c. Call the configured STT API.
+    2. Fall back to QQ's built-in ``asr_refer_text`` when STT is not
+       configured, or when the STT pipeline fails to produce a transcript
+       (download error, conversion error, empty API response, etc.).
+
+    The configured STT engine is preferred because users typically opt in
+    to a higher-quality model than QQ's free built-in ASR. ``asr_refer_text``
+    serves as a graceful fallback so we still return *something* whenever
+    QQ provides a hint.
 
     Each step is a separate method (CC ≤ 5 each).
 
@@ -502,25 +510,77 @@ class STTPipeline:
         """Transcribe a voice attachment to text.
 
         :param att: The voice :class:`~dto.MessageAttachment`.
-        :returns: Transcript string, or ``None`` if transcription fails.
+        :returns: Transcript string, or ``None`` if both the STT engine and
+            QQ's built-in ASR fail to produce text.
         """
-        # Step 1: built-in ASR (free, always preferred)
+        transcript, _ = await self.transcribe_with_path(att)
+        return transcript
+
+    async def transcribe_with_path(
+        self,
+        att: Any,
+    ) -> tuple[Optional[str], Optional[str]]:
+        """Transcribe a voice attachment **and** return its cached WAV path.
+
+        Same priority rules as :meth:`transcribe`:
+
+        1. Configured STT engine (when available)
+        2. QQ built-in ``asr_refer_text`` fallback
+
+        Whether STT runs successfully or not, if the WAV download succeeded
+        the cached file is **kept** on disk and its path is returned, so
+        callers can reuse it (e.g. populate
+        :attr:`ProcessedAttachment.local_path`).
+
+        :returns: ``(transcript_or_None, wav_path_or_None)``. Either / both
+            may be ``None`` independently — for example, ``asr_refer_text``
+            without a configured STT yields ``(text, None)``; a successful
+            STT yields ``(text, "/cache/xxx.wav")``; a failed download with
+            no ASR fallback yields ``(None, None)``.
+        """
+        # Step 1: try the configured STT engine first (when available).
+        stt_text, wav_path = await self._try_configured_stt(att)
+        if stt_text:
+            return stt_text, wav_path
+
+        # Step 2: fall back to QQ's built-in ASR hint. Note this branch may
+        # still return a wav_path if the STT pipeline had downloaded the
+        # WAV before failing at the API step.
         builtin = self._use_builtin_asr(att)
         if builtin is not None:
-            return builtin
+            return builtin, wav_path
 
-        # Step 2: resolve download URL
+        return None, wav_path
+
+    async def _try_configured_stt(
+        self,
+        att: Any,
+    ) -> tuple[Optional[str], Optional[str]]:
+        """Run the configured STT pipeline.
+
+        :returns: ``(transcript_or_None, wav_path_or_None)``. ``wav_path``
+            is set whenever the audio download/convert step succeeded, even
+            if the subsequent STT API call failed — the cached WAV is kept
+            so callers can still surface a local path for the attachment.
+        """
+        # Skip cleanly when STT is not configured.
+        if self._stt_config_fn() is None:
+            logger.debug(
+                "[%s] STT: no engine configured, skipping",
+                self._log_tag,
+            )
+            return None, None
+
         url = self._resolve_download_url(att)
         if not url:
-            return None
+            return None, None
 
-        # Step 3: download + convert to WAV
         wav_path = await self._download_and_convert(url, att.filename)
         if not wav_path:
-            return None
+            return None, None
 
-        # Step 4: call STT API
-        return await self._call_stt_api(wav_path)
+        transcript = await self._call_stt_api(wav_path)
+        return transcript, wav_path
 
     def _use_builtin_asr(self, att: Any) -> Optional[str]:
         """Return QQ's built-in ASR text if available."""
@@ -554,35 +614,32 @@ class STTPipeline:
         return wav_path
 
     async def _call_stt_api(self, wav_path: str) -> Optional[str]:
-        """Call the configured STT API and clean up the temp file."""
+        """Call the configured STT API.
+
+        The ``wav_path`` is **not** removed afterwards — it lives in the
+        downloader's cache directory and the caller is expected to either
+        reuse it (e.g. via :attr:`ProcessedAttachment.local_path`) or rely
+        on the downloader's cache eviction policy.
+        """
         stt_cfg = self._stt_config_fn()
         if not stt_cfg:
-            logger.warning(
-                "[%s] STT not configured (no stt config or QQ_STT_API_KEY)",
+            # Defensive: callers should have checked already via
+            # _try_configured_stt(), but keep the guard to avoid NPE.
+            logger.debug(
+                "[%s] STT: config disappeared before API call",
                 self._log_tag,
             )
-            self._cleanup(wav_path)
             return None
 
-        try:
-            transcript = await call_stt(
-                self._http_client,
-                wav_path,
-                stt_cfg,
-                self._log_tag,
-            )
-        finally:
-            self._cleanup(wav_path)
+        transcript = await call_stt(
+            self._http_client,
+            wav_path,
+            stt_cfg,
+            self._log_tag,
+        )
 
         if transcript:
             logger.debug("[%s] STT success: %r", self._log_tag, transcript[:100])
         else:
             logger.warning("[%s] STT: API returned empty transcript", self._log_tag)
         return transcript
-
-    @staticmethod
-    def _cleanup(path: str) -> None:
-        try:
-            os.unlink(path)
-        except OSError:
-            pass

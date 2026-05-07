@@ -36,3 +36,8 @@ htmlcov/
 e2e_report.json
 e2e_session.json
 **/e2e_test_files/
+
+# Local environment overrides — must NOT be committed
+.env
+.env.local
+.env.*.local

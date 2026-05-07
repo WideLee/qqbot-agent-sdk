@@ -120,11 +120,24 @@ def _safe_url_for_log(url: str, max_len: int = 80) -> str:
 class ProcessedAttachment:
     """Processed attachment descriptor.
 
+    All three textual fields are populated when meaningful, so consumers
+    can pick the level of detail they need:
+
+    - ``transcript``: structured field holding the voice recognition
+      result (STT or QQ ``asr_refer_text``). Empty for non-voice or when
+      no transcript could be produced.
+    - ``description``: human-readable, prompt-friendly view (built via
+      :func:`describe_attachment`); already includes ``transcript`` for
+      voice attachments. Use this when stitching attachment context into
+      a single text body for an LLM.
+    - ``local_path``: absolute path to the locally cached file (the WAV
+      for voice attachments). Empty when the download failed.
+
     :param kind: ``'image'`` | ``'voice'`` | ``'video'`` | ``'document'``.
     :param local_path: Absolute path to the locally cached file.
     :param content_type: MIME type of the attachment.
-    :param transcript: Voice transcript (populated when ``kind='voice'``).
-    :param description: Human-readable description for non-image attachments.
+    :param transcript: Voice transcription text (for ``kind='voice'``).
+    :param description: Unified human-readable description.
     """
 
     kind: str
@@ -466,22 +479,57 @@ class AttachmentProcessor:
         self,
         att: MessageAttachment,
     ) -> Optional[ProcessedAttachment]:
-        if self._stt is None:
-            return None
-        transcript = await self._stt.transcribe(att)
-        if transcript:
-            return ProcessedAttachment(
-                kind="voice",
-                local_path="",
-                content_type=att.content_type,
-                transcript=transcript,
-            )
+        """Process a voice attachment.
+
+        Behaviour matrix (priority order):
+
+        - **STT pipeline available** → call ``transcribe_with_path``, which
+          downloads the WAV (kept in cache) and runs the configured STT
+          engine, falling back to ``asr_refer_text`` if STT yields nothing.
+          Both ``local_path`` (WAV) and ``transcript`` are populated when
+          available.
+        - **No STT pipeline** → still try to download the WAV directly
+          (so ``local_path`` is meaningful for downstream consumers) and
+          surface ``att.asr_refer_text`` as the transcript.
+        """
+        transcript: Optional[str] = None
+        local_path: Optional[str] = None
+
+        if self._stt is not None:
+            transcript, local_path = await self._stt.transcribe_with_path(att)
+        else:
+            # Without an STT engine: download WAV ourselves (so
+            # ``local_path`` is filled) and fall back to QQ's built-in
+            # ASR for the transcript.
+            url = self._best_voice_url(att)
+            if url:
+                local_path = await self._downloader.download_audio(url, att.filename)
+            transcript = att.asr_refer_text or None
+
         return ProcessedAttachment(
             kind="voice",
-            local_path="",
+            local_path=local_path or "",
             content_type=att.content_type,
-            transcript="[语音识别失败]",
+            transcript=transcript or "",
+            description=describe_attachment(
+                att.content_type,
+                att.filename,
+                local_path,
+                transcript=transcript or "",
+            ),
         )
+
+    @staticmethod
+    def _best_voice_url(att: MessageAttachment) -> str:
+        """Return the best URL to download a voice attachment from.
+
+        Mirrors :meth:`STTPipeline._resolve_download_url` — prefers
+        ``voice_wav_url`` (pre-converted WAV from QQ) over the raw URL.
+        """
+        wav_url = att.voice_wav_url.strip()
+        if wav_url:
+            return f"https:{wav_url}" if wav_url.startswith("//") else wav_url
+        return att.resolved_url
 
     async def _handle_image(
         self,
@@ -500,12 +548,11 @@ class AttachmentProcessor:
         filename: str,
     ) -> Optional[ProcessedAttachment]:
         local_path = await self._downloader.download_document(url, filename)
-        desc = f"[video: {filename} ({local_path})]" if local_path else f"[video: {filename}]"
         return ProcessedAttachment(
             kind="video",
             local_path=local_path or "",
             content_type=ct,
-            description=desc,
+            description=describe_attachment(ct, filename, local_path),
         )
 
     async def _handle_document(
@@ -515,13 +562,15 @@ class AttachmentProcessor:
         filename: str,
     ) -> Optional[ProcessedAttachment]:
         local_path = await self._downloader.download_document(url, filename)
-        name = filename or ct
-        desc = f"[file: {name} ({local_path})]" if local_path else f"[file: {name}]"
+        # Fall back to MIME type when no original filename is provided so the
+        # description still carries useful identification (matches legacy
+        # behaviour: ``[file: text/plain (...)]``).
+        display_name = filename or ct
         return ProcessedAttachment(
             kind="document",
             local_path=local_path or "",
             content_type=ct,
-            description=desc,
+            description=describe_attachment(ct, display_name, local_path),
         )
 
 
@@ -539,21 +588,34 @@ def describe_attachment(
     content_type: str,
     filename: str,
     local_path: Optional[str] = None,
+    transcript: str = "",
 ) -> str:
     """Build a human-readable text description for a QQ Bot attachment.
 
-    Used to embed attachment context into plain-text message bodies when the
-    attachment itself cannot be rendered (e.g. in quoted/reference messages).
+    Used to embed attachment context into plain-text message bodies — both
+    for processed attachments (voice transcribed via STT) and for
+    quoted/reference messages where the SDK only sees the raw metadata.
 
     :param content_type: MIME type string (e.g. ``"image/jpeg"``).
     :param filename: Original filename from the attachment metadata.
     :param local_path: Local cached file path, if available.
+    :param transcript: Voice transcription text, when known (either from
+        QQ's ``asr_refer_text`` or a configured STT engine). Only used by
+        the voice/audio branch; ignored for other attachment types.
     :returns: A short bracketed description string.
 
     Examples::
 
         describe_attachment("image/jpeg", "photo.jpg", "/tmp/cache/photo.jpg")
         # → "[image: photo.jpg (/tmp/cache/photo.jpg)]"
+
+        describe_attachment("audio/silk", "", None, transcript="你好")
+        # → "[voice: 你好]"
+
+        describe_attachment(
+            "voice", "a.amr", "/tmp/a.wav", transcript="一二三四",
+        )
+        # → "[voice: 一二三四 (/tmp/a.wav)]"
 
         describe_attachment("audio/silk", "", None)
         # → "[voice message]"
@@ -564,6 +626,7 @@ def describe_attachment(
     ct = content_type.lower()
     fname = filename or ""
     cached = local_path or ""
+    text = (transcript or "").strip()
 
     if ct.startswith("image/"):
         if fname and cached:
@@ -573,7 +636,13 @@ def describe_attachment(
         return "[image]"
 
     if "audio" in ct or "voice" in ct or "silk" in ct:
-        return f"[voice message ({cached})]" if cached else "[voice message]"
+        if text and cached:
+            return f"[voice: {text} ({cached})]"
+        if text:
+            return f"[voice: {text}]"
+        if cached:
+            return f"[voice message ({cached})]"
+        return "[voice message]"
 
     if ct.startswith("video/"):
         if fname and cached:
