@@ -318,8 +318,11 @@ def mock_attachment():
 
 
 @pytest.mark.asyncio
-async def test_stt_pipeline_uses_builtin_asr(mock_downloader):
-    """Test STTPipeline uses QQ's built-in ASR when available."""
+async def test_stt_pipeline_prefers_configured_stt_over_asr_refer_text(mock_downloader):
+    """Configured STT must run even when QQ asr_refer_text is present.
+
+    Priority: configured STT > QQ built-in asr_refer_text.
+    """
     mock_http_client = AsyncMock()
 
     def stt_config_fn():
@@ -329,13 +332,88 @@ async def test_stt_pipeline_uses_builtin_asr(mock_downloader):
             model="whisper-1",
         )
 
+    # Mock a successful STT pipeline run.
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        tmp.write(b"wav_data")
+        tmp_path = tmp.name
+
+    try:
+        mock_downloader.download_audio = AsyncMock(return_value=tmp_path)
+
+        mock_stt_response = Mock()
+        mock_stt_response.json = Mock(return_value={"text": "stt-result"})
+        mock_stt_response.raise_for_status = Mock()
+        mock_http_client.post = AsyncMock(return_value=mock_stt_response)
+
+        pipeline = STTPipeline(
+            http_client=mock_http_client,
+            stt_config_fn=stt_config_fn,
+            downloader=mock_downloader,
+        )
+
+        # Attachment has *both* asr_refer_text and a downloadable URL.
+        att = Mock()
+        att.asr_refer_text = "qq-asr-text"
+        att.voice_wav_url = ""
+        att.resolved_url = "https://cdn.qq.com/voice.silk"
+        att.filename = "voice.silk"
+
+        result = await pipeline.transcribe(att)
+
+        # Configured STT wins even though asr_refer_text is set.
+        assert result == "stt-result"
+        mock_downloader.download_audio.assert_called_once()
+        mock_http_client.post.assert_called_once()
+    finally:
+        if Path(tmp_path).exists():
+            os.unlink(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_stt_pipeline_falls_back_to_asr_refer_text_when_stt_fails(mock_downloader):
+    """When configured STT fails, fall back to QQ asr_refer_text."""
+    mock_http_client = AsyncMock()
+
+    def stt_config_fn():
+        return STTConfig(
+            base_url="https://api.openai.com/v1",
+            api_key="sk-test",
+        )
+
+    # STT pipeline fails at the download step.
+    mock_downloader.download_audio = AsyncMock(return_value=None)
+
     pipeline = STTPipeline(
         http_client=mock_http_client,
         stt_config_fn=stt_config_fn,
         downloader=mock_downloader,
     )
 
-    # Attachment with built-in ASR
+    att = Mock()
+    att.asr_refer_text = "qq-asr-fallback"
+    att.voice_wav_url = ""
+    att.resolved_url = "https://cdn.qq.com/voice.silk"
+    att.filename = "voice.silk"
+
+    result = await pipeline.transcribe(att)
+
+    assert result == "qq-asr-fallback"
+
+
+@pytest.mark.asyncio
+async def test_stt_pipeline_uses_asr_refer_text_when_no_stt_config(mock_downloader):
+    """Without a configured STT engine, asr_refer_text is used directly."""
+    mock_http_client = AsyncMock()
+
+    def stt_config_fn():
+        return None
+
+    pipeline = STTPipeline(
+        http_client=mock_http_client,
+        stt_config_fn=stt_config_fn,
+        downloader=mock_downloader,
+    )
+
     att = Mock()
     att.asr_refer_text = "你好世界"
     att.voice_wav_url = ""
@@ -345,7 +423,7 @@ async def test_stt_pipeline_uses_builtin_asr(mock_downloader):
     result = await pipeline.transcribe(att)
 
     assert result == "你好世界"
-    # Should not download or call STT API
+    # No STT pipeline activity at all when not configured.
     mock_downloader.download_audio.assert_not_called()
     mock_http_client.post.assert_not_called()
 
@@ -398,32 +476,24 @@ async def test_stt_pipeline_prefers_wav_url(mock_downloader, mock_attachment):
 
 @pytest.mark.asyncio
 async def test_stt_pipeline_no_config(mock_downloader, mock_attachment):
-    """Test STTPipeline returns None when STT not configured."""
+    """Test STTPipeline returns None when STT not configured and no asr_refer_text."""
     mock_http_client = AsyncMock()
 
     def stt_config_fn():
         return None
 
-    # Mock download
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-        tmp.write(b"wav_data")
-        tmp_path = tmp.name
+    # mock_attachment.asr_refer_text is "" by default → no fallback either.
+    pipeline = STTPipeline(
+        http_client=mock_http_client,
+        stt_config_fn=stt_config_fn,
+        downloader=mock_downloader,
+    )
 
-    try:
-        mock_downloader.download_audio = AsyncMock(return_value=tmp_path)
+    result = await pipeline.transcribe(mock_attachment)
 
-        pipeline = STTPipeline(
-            http_client=mock_http_client,
-            stt_config_fn=stt_config_fn,
-            downloader=mock_downloader,
-        )
-
-        result = await pipeline.transcribe(mock_attachment)
-
-        assert result is None
-    finally:
-        if Path(tmp_path).exists():
-            os.unlink(tmp_path)
+    assert result is None
+    # STT pipeline must not run when no engine is configured.
+    mock_downloader.download_audio.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -524,6 +594,82 @@ async def test_full_stt_pipeline():
 
         assert result == "完整测试"
         mock_downloader.download_audio.assert_called_once()
+        # Pipeline must NOT delete the cached WAV — it lives in the
+        # downloader cache and may be reused by AttachmentProcessor to
+        # populate ProcessedAttachment.local_path.
+        assert Path(tmp_path).exists()
     finally:
-        # Pipeline should clean up temp file
-        pass  # File already cleaned by pipeline
+        if Path(tmp_path).exists():
+            os.unlink(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_stt_pipeline_transcribe_with_path_returns_wav(mock_downloader, mock_attachment):
+    """transcribe_with_path returns both transcript and WAV path on success."""
+    mock_http_client = AsyncMock()
+
+    def stt_config_fn():
+        return STTConfig(
+            base_url="https://api.openai.com/v1",
+            api_key="sk-test",
+        )
+
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        tmp.write(b"wav_data")
+        tmp_path = tmp.name
+
+    try:
+        mock_downloader.download_audio = AsyncMock(return_value=tmp_path)
+
+        mock_stt_response = Mock()
+        mock_stt_response.json = Mock(return_value={"text": "hello"})
+        mock_stt_response.raise_for_status = Mock()
+        mock_http_client.post = AsyncMock(return_value=mock_stt_response)
+
+        pipeline = STTPipeline(
+            http_client=mock_http_client,
+            stt_config_fn=stt_config_fn,
+            downloader=mock_downloader,
+        )
+
+        transcript, wav_path = await pipeline.transcribe_with_path(mock_attachment)
+
+        assert transcript == "hello"
+        assert wav_path == tmp_path
+        # WAV must remain on disk after transcribe_with_path returns.
+        assert Path(wav_path).exists()
+    finally:
+        if Path(tmp_path).exists():
+            os.unlink(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_stt_pipeline_transcribe_with_path_no_stt_returns_none_path():
+    """Without STT config, transcribe_with_path returns (asr_text, None).
+
+    No download is attempted because there's no engine to call.
+    """
+    mock_http_client = AsyncMock()
+    mock_downloader = Mock()
+    mock_downloader.download_audio = AsyncMock()
+
+    def stt_config_fn():
+        return None
+
+    pipeline = STTPipeline(
+        http_client=mock_http_client,
+        stt_config_fn=stt_config_fn,
+        downloader=mock_downloader,
+    )
+
+    att = Mock()
+    att.asr_refer_text = "qq-asr"
+    att.voice_wav_url = ""
+    att.resolved_url = "https://cdn.qq.com/voice.silk"
+    att.filename = "voice.silk"
+
+    transcript, wav_path = await pipeline.transcribe_with_path(att)
+
+    assert transcript == "qq-asr"
+    assert wav_path is None
+    mock_downloader.download_audio.assert_not_called()

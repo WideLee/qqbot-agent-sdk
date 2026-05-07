@@ -17,6 +17,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import time
 from pathlib import Path
 from typing import Optional, Dict, Set
@@ -63,6 +64,11 @@ from qqbot_agent_sdk import (
     GuildMessageToCreate,
     InputNotify,
     
+    # Audio / STT
+    STTConfig,
+    STTPipeline,
+    resolve_stt_config,
+    
     # Constants
     MEDIA_TYPE_IMAGE,
     MEDIA_TYPE_VIDEO,
@@ -95,6 +101,65 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+# ─────────────────────────────────────────────────────────────────────
+# .env loader (no third-party dependency)
+# ─────────────────────────────────────────────────────────────────────
+
+def _load_dotenv(env_path: Path) -> None:
+    """Populate ``os.environ`` from a ``KEY=VALUE`` file.
+
+    Only sets keys that aren't already present in the environment, so
+    real env vars always win. Quietly skips when the file is missing —
+    e2e_test runs fine without a ``.env`` (just won't have STT enabled
+    unless ``QQ_STT_API_KEY`` is exported some other way).
+    """
+    if not env_path.is_file():
+        return
+    try:
+        for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+    except OSError as exc:
+        logger.warning("加载 %s 失败: %s", env_path, exc)
+
+
+# Load .env from the repo root (parent of ``examples/``).
+_load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+
+
+def _resolve_stt_config_from_env() -> Optional[STTConfig]:
+    """Build an STT config from the loaded environment.
+
+    Priority:
+
+    1. ``QQ_STT_API_KEY`` (and the matching base URL / model env vars)
+       — handled by :func:`resolve_stt_config` from the SDK.
+    2. ``OPENAI_API_KEY`` — convenience fallback that maps to OpenAI
+       Whisper (``base_url=https://api.openai.com/v1``,
+       ``model=whisper-1``). Handy when the user reuses an existing
+       OpenAI key without setting QQ_STT_* explicitly.
+    """
+    cfg = resolve_stt_config({})
+    if cfg is not None:
+        return cfg
+
+    openai_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not openai_key:
+        return None
+
+    return STTConfig(
+        base_url=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/"),
+        api_key=openai_key,
+        model=os.getenv("OPENAI_STT_MODEL", "whisper-1"),
+    )
+
+
 class E2ETest:
     """端到端测试"""
     
@@ -121,7 +186,30 @@ class E2ETest:
             cache_dir=str(self.test_dir / "attachments"),
             log_tag="E2E",
         )
-        self.attachment_processor = AttachmentProcessor(self.attachment_downloader)
+
+        # STT pipeline — built from .env / environment. None when no key
+        # is configured; in that case voice attachments fall back to QQ's
+        # built-in ``asr_refer_text`` automatically.
+        self.stt_config = _resolve_stt_config_from_env()
+        if self.stt_config is not None:
+            logger.info(
+                "🎙️  STT 已启用: base_url=%s model=%s",
+                self.stt_config.base_url, self.stt_config.model,
+            )
+            self.stt_pipeline: Optional[STTPipeline] = STTPipeline(
+                http_client=self.http_client,
+                stt_config_fn=lambda: self.stt_config,
+                downloader=self.attachment_downloader,
+                log_tag="E2E",
+            )
+        else:
+            logger.info("🎙️  未配置 STT (设置 OPENAI_API_KEY 或 QQ_STT_API_KEY 启用)")
+            self.stt_pipeline = None
+
+        self.attachment_processor = AttachmentProcessor(
+            downloader=self.attachment_downloader,
+            stt_pipeline=self.stt_pipeline,
+        )
         # MediaLoader 是静态类，不需要实例化
         self.media_uploader = MediaUploader(self.api, self.http_client, log_tag="E2E")
         self.approval_sender = ApprovalSender(self.api, log_tag="E2E")
@@ -462,15 +550,36 @@ class E2ETest:
     
     async def handle_normal_message(self, event: InboundEvent):
         """处理普通消息"""
-        # 引用消息 - 回显被引用的原文
+        # 引用消息 - 回显被引用的原文（含附件描述与语音转写）
         if event.message_type == MSG_TYPE_QUOTE and event.msg_elements:
             quoted = event.msg_elements[0]
             reply_parts = [f"收到: {event.content}"]
-            reply_parts.append(f"\n📎 引用原文: {quoted.content}" if quoted.content else "\n📎 引用原文: (无文字)")
+            reply_parts.append(
+                f"\n📎 引用原文: {quoted.content}" if quoted.content else "\n📎 引用原文: (无文字)"
+            )
+
+            # 引用消息中的附件也走同一个 processor，确保正文/引用使用
+            # 完全一致的 description 格式（含语音 STT/asr_refer_text）。
             if quoted.attachments:
-                att_names = [a.filename for a in quoted.attachments]
-                reply_parts.append(f"📎 引用附件: {', '.join(att_names)}")
-            
+                quoted_processed = await self.attachment_processor.process(quoted.attachments)
+                if quoted_processed:
+                    descriptions = [p.description for p in quoted_processed if p.description]
+                    if descriptions:
+                        reply_parts.append("📎 引用附件: " + " ".join(descriptions))
+                    # 若引用里有语音并被识别为文字，单独高亮一条提示。
+                    voice_transcripts = [
+                        p.transcript for p in quoted_processed
+                        if p.kind == "voice" and p.transcript
+                    ]
+                    if voice_transcripts:
+                        for t in voice_transcripts:
+                            reply_parts.append(f"🎤 引用语音识别: {t}")
+                        self.tested_features.add("quote_voice_asr")
+                else:
+                    # 处理失败时退回到简单的文件名列表
+                    att_names = [a.filename for a in quoted.attachments]
+                    reply_parts.append(f"📎 引用附件: {', '.join(att_names)}")
+
             await self.api.send_text(
                 event.chat_scope,
                 event.chat_id,
@@ -494,10 +603,15 @@ class E2ETest:
             await self.process_attachments(event)
     
     async def process_attachments(self, event: InboundEvent):
-        """处理附件 - 下载后重新上传发送回去"""
+        """处理附件 - 下载后重新上传发送回去。
+
+        统一走 :class:`AttachmentProcessor.process` —— 包括语音消息。
+        语音的 STT 转写由注入的 :class:`STTPipeline` 自动处理：
+        优先调用配置的 STT，失败时回退到 QQ 的 ``asr_refer_text``。
+        """
         # 确保 attachments 是列表
         attachments = event.attachments if isinstance(event.attachments, list) else [event.attachments]
-        
+
         # ── 调试: 打印收到的原始附件信息 ──
         logger.info("=" * 60)
         logger.info(f"📥 收到 {len(attachments)} 个附件")
@@ -509,62 +623,59 @@ class E2ETest:
             logger.info(f"       resolved_url  = {att.resolved_url[:80]!r}..." if len(att.resolved_url) > 80 else f"       resolved_url  = {att.resolved_url!r}")
             logger.info(f"       asr_refer_text= {att.asr_refer_text!r}")
         logger.info("=" * 60)
-        
-        for att in attachments:
+
+        # 一次性下载并处理全部附件（含语音 STT）。
+        processed_list = await self.attachment_processor.process(attachments)
+        if len(processed_list) != len(attachments):
+            logger.warning(
+                "⚠️ 部分附件处理失败: 输入 %d 个, 处理成功 %d 个",
+                len(attachments), len(processed_list),
+            )
+
+        for att, processed in zip(attachments, processed_list):
             try:
                 content_type = att.content_type.strip().lower()
-                
-                # 1. 下载附件到本地
-                # 语音文件不走 AttachmentProcessor（需要 STT），直接用 downloader 下载
-                if content_type.startswith("audio") or att.filename.endswith((".amr", ".silk")):
-                    local_path_str = await self.attachment_downloader.download_document(
-                        att.resolved_url, att.filename,
+                logger.info(
+                    "📦 处理结果: kind=%s, local_path=%s, transcript=%r, description=%r",
+                    processed.kind,
+                    processed.local_path,
+                    processed.transcript[:60] + "…" if len(processed.transcript) > 60 else processed.transcript,
+                    processed.description,
+                )
+
+                if not processed.local_path:
+                    logger.warning(f"⚠️ 附件无本地缓存: {att.filename}")
+                    await self.api.send_text(
+                        event.chat_scope,
+                        event.chat_id,
+                        f"⚠️ 无法下载附件: {att.filename}",
+                        reply_to=event.message_id,
                     )
-                    if not local_path_str:
-                        logger.warning(f"⚠️ 语音下载失败: {att.filename}")
-                        await self.api.send_text(
-                            event.chat_scope,
-                            event.chat_id,
-                            f"⚠️ 语音下载失败: {att.filename}",
-                            reply_to=event.message_id,
-                        )
-                        continue
-                    local_path = Path(local_path_str)
-                    logger.info(f"✓ 语音已下载: {att.filename} → {local_path}")
-                else:
-                    # 图片/视频/文档走 AttachmentProcessor
-                    results = await self.attachment_processor.process([att])
-                    
-                    if not results:
-                        logger.warning(f"⚠️ 附件处理返回空结果: {att.filename}")
-                        await self.api.send_text(
-                            event.chat_scope,
-                            event.chat_id,
-                            f"⚠️ 无法处理附件: {att.filename}",
-                            reply_to=event.message_id,
-                        )
-                        continue
-                    
-                    processed = results[0]
-                    logger.info(f"📦 处理结果: kind={processed.kind}, local_path={processed.local_path}")
-                    
-                    local_path = Path(processed.local_path)
-                    if not local_path.exists():
-                        logger.error(f"❌ 本地文件不存在: {local_path}")
-                        continue
-                
+                    continue
+
+                local_path = Path(processed.local_path)
+                if not local_path.exists():
+                    logger.error(f"❌ 本地文件不存在: {local_path}")
+                    continue
+
                 self.tested_features.add("attachment_download")
                 file_size = local_path.stat().st_size
                 logger.info(f"✓ 已下载: {att.filename} → {local_path} ({file_size} 字节)")
-                
-                # 3. 语音识别 - 回显 QQ 服务端的 ASR 结果（不依赖本地 STT）
-                if content_type.startswith("audio") or att.filename.endswith((".amr", ".silk")):
-                    if att.asr_refer_text:
-                        self.tested_features.add("voice_asr")
+
+                # 语音消息：回显转写文本（来自 STT 或 asr_refer_text）。
+                if processed.kind == "voice":
+                    if processed.transcript:
+                        # transcript 来自 STT 时记录 stt_pipeline 特性，
+                        # 来自 asr_refer_text 时记录 voice_asr 特性。
+                        feature = (
+                            "stt_pipeline" if self.stt_pipeline is not None
+                            else "voice_asr"
+                        )
+                        self.tested_features.add(feature)
                         await self.api.send_text(
                             event.chat_scope,
                             event.chat_id,
-                            f"🎤 语音识别: {att.asr_refer_text}",
+                            f"🎤 语音识别: {processed.transcript}",
                             reply_to=event.message_id,
                         )
                     else:
@@ -574,24 +685,24 @@ class E2ETest:
                             "🎤 收到语音消息（无识别文本）",
                             reply_to=event.message_id,
                         )
-                
+
                 # 4. 确定上传类型（content_type 在循环开头已定义）
                 if content_type.startswith("image"):
                     file_type = MEDIA_TYPE_IMAGE
                 elif content_type.startswith("video"):
                     file_type = MEDIA_TYPE_VIDEO
-                elif content_type.startswith("audio"):
+                elif content_type.startswith("audio") or processed.kind == "voice":
                     file_type = MEDIA_TYPE_VOICE
                 else:
                     file_type = MEDIA_TYPE_FILE
-                
+
                 # ── 调试: 打印上传请求参数 ──
                 logger.info("📤 上传请求:")
                 logger.info(f"   chat_type = {event.chat_scope!r}")
                 logger.info(f"   chat_id   = {event.chat_id!r}")
                 logger.info(f"   source    = {str(local_path)!r}")
                 logger.info(f"   file_type = {file_type} (content_type={content_type!r})")
-                
+
                 # 5. 用本地文件重新上传
                 file_info = await self.media_uploader.upload(
                     chat_type=event.chat_scope,
@@ -599,9 +710,9 @@ class E2ETest:
                     source=str(local_path),
                     file_type=file_type,
                 )
-                
+
                 logger.info(f"✓ 上传成功, file_info={file_info[:80]}..." if len(file_info) > 80 else f"✓ 上传成功, file_info={file_info}")
-                
+
                 # 6. 发送富媒体消息
                 msg = MessageToCreate(
                     msg_type=QQMessageType.RICH_MEDIA,
@@ -609,17 +720,17 @@ class E2ETest:
                     msg_id=event.message_id,
                     media=MediaInfo(file_info=file_info),
                 )
-                
+
                 # ── 调试: 打印发送消息体 ──
                 logger.info(f"📨 发送消息: msg_type={msg.msg_type}, msg_id={msg.msg_id}")
-                
+
                 if event.chat_scope == "c2c":
                     resp = await self.api.post_c2c_message(event.chat_id, msg)
                 else:
                     resp = await self.api.post_group_message(event.chat_id, msg)
-                
+
                 logger.info(f"✓ 已回显: {att.filename}")
-            
+
             except Exception as exc:
                 import traceback
                 logger.error(f"附件处理失败: {exc}")
@@ -1037,7 +1148,7 @@ print("Hello!")
             "upload_image", "upload_file", "upload_url",
             "approval_send", "approval_response",
             "custom_keyboard", "keyboard_click",
-            "attachment_download", "voice_asr",
+            "attachment_download", "voice_asr", "stt_pipeline", "quote_voice_asr",
             "typing_indicator", "batch_send", "retry_mechanism",
             "heartbeat", "session_persist",
         }
